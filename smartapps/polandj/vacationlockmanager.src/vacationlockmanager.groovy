@@ -23,28 +23,179 @@ definition(
     iconX2Url: "https://s3.amazonaws.com/smartapp-icons/Convenience/Cat-Convenience@2x.png",
     iconX3Url: "https://s3.amazonaws.com/smartapp-icons/Convenience/Cat-Convenience@2x.png")
 
-
 preferences {
-	section("Title") {
-		// TODO: put inputs here
-	}
+	section("Info") {
+    	paragraph title: "API ID",app.getId()
+    }
+	section("Settings") {
+    	input "lock","capability.lockCodes", title: "Locks", multiple: true
+        input "phone", "phone", title: "Send a Text Message?", required: false
+    }  
 }
 
-def installed() {
-	log.debug "Installed with settings: ${settings}"
+mappings {
+  path("/reservation") {
+    action: [
+      POST: "addReservation"
+    ]
+  }
+}
 
+import groovy.json.JsonSlurper
+
+def installed() {
 	initialize()
 }
 
 def updated() {
-	log.debug "Updated with settings: ${settings}"
-
 	unsubscribe()
 	initialize()
 }
 
 def initialize() {
-	// TODO: subscribe to attributes, devices, locations, etc.
+	subscribe(lock, "codeReport", codereturn)
+    subscribe(lock, "lock", codeUsed)
 }
 
-// TODO: implement event handlers
+def codereturn(evt) {
+    log.debug "codereturn"
+    def username = "$evt.value"
+    def code = "$evt.data"
+    //def code = evt.data.replaceAll("\\D+","")
+    if (code == "") {
+        def message = "User in slot $evt.value was deleted from $evt.displayName"
+        log.debug message
+    } else {
+        def message = "Code for user $username in user slot $evt.value was set to $code on $evt.displayName"
+        log.debug message
+    }
+}
+
+def codeUsed(evt) {
+    if(evt.value == "unlocked" && evt.data) {
+        def username
+        def sendCode
+        def codeData = new JsonSlurper().parseText(evt.data)
+        settings.each {
+            if( it.key == "username${codeData.usedCode}" ) {
+                username = "$it.value"
+            }
+            if ( it.key == "sendCode${codeData.usedCode}" ) {
+                sendCode = "$it.value"
+            }
+        }
+        if (username.toLowerCase().contains("cleaners")) {
+        	runIn(7 * 3600, cleanersCame)
+        }
+    }
+}
+
+private addCode(data) {
+	def name = data?.name
+    def phone = data?.phone
+    def code = phone[-4..-1]
+
+	def slot = findSlotNamed(name)
+    if (!slot) {
+    	slot = findEmptySlot()
+    }
+    //lock.setCode(slot, code, name)
+    notify("Set code '$code' for $name in slot $slot")
+	log.debug "Set code $name = $code in slot $slot"
+}
+
+private delCode(data) {
+	def name = data?.name
+    def phone = data?.phone
+    def code = phone[-4..-1]
+
+	def slot = findSlotNamed(name)
+    if (slot) {
+    	//lock.deleteCode(slot)
+    	notify("Deleted code for $name in slot $slot")
+    } else {
+    	notify("Tried to delete code for $name, but it was already deleted")
+    	log.info "Tried to delete for $name, but it was already deleted"
+    }
+}
+
+private findSlotNamed(user) {
+	def lockCodes = lock.currentValue("lockCodes").first()
+    def codeData = new JsonSlurper().parseText(lockCodes)
+	def x = codeData.find{ it.value == user }?.key
+    if (x) {
+    	log.debug "User $user is in slot $x"
+   	}
+    return x
+}
+
+private findEmptySlot() {
+	def lockCodes = lock.currentValue("lockCodes").first()
+    def codeData = new JsonSlurper().parseText(lockCodes)
+    def maxCodes = lock.currentValue("maxCodes").first().toInteger()
+    def emptySlot = null
+    for (def i = 1; i <= maxCodes; i++) {
+    	if (!codeData.get("$i")) {
+        	emptySlot = i
+            break
+        }
+    }
+    log.debug "Next empty slot is $emptySlot"
+    return emptySlot
+}
+    
+
+def addReservation() {
+	Date now = new Date();
+	def sdf = new java.text.SimpleDateFormat("MMM dd, yyyy")
+    sdf.setTimeZone(TimeZone.getTimeZone("EST"));
+    
+    def addOnDate = sdf.parse(request.JSON?.checkin)
+    addOnDate.setTime(addOnDate.getTime() - (15 * 3600000))
+    if (addOnDate > now) {
+    	runOnce(addOnDate, addCode, [data:request.JSON])
+    } else {
+    	log.error "Check-in is in the past! $addOnDate < $now"
+    }
+    
+    def delOnDate = sdf.parse(request.JSON?.checkout)
+    delOnDate.setTime(delOnDate.getTime() + (18 * 3600000))
+    if (delOnDate > now) {
+        runOnce(delOnDate, delCode, [data:request.JSON])
+    } else {
+    	log.error "Check-out is in the past! $delOnDate < $now"
+    }
+    
+	/*Date now = new Date();
+    now.setTime(now.getTime() + 5000);
+    runOnce(now, addCode, [data:request.JSON])
+    now.setTime(now.getTime() + 25000);
+    runOnce(now, delCode, [data:request.JSON])*/
+    
+    /*def df = new java.text.SimpleDateFormat("MMM dd, yyyy")
+	df.setLenient(false)
+	def parsed = df.parse("Sep 18, 2018")
+    log.debug df.parse("Aug 22, 2019")
+    log.debug df.parse("Jul 1, 2019")*/
+    
+	/*def name = request.JSON?.name
+    def phone = request.JSON?.phone
+    def checkin = request.JSON?.checkin
+    def checkout = request.JSON?.checkout
+    def lockCodes = lock.currentValue("lockCodes")
+
+	lock.setCode(10, "1234", "API")*/
+
+	log.debug "Posted a new reservation"
+}
+
+private cleanersCame() {
+	notify("The cleaners came a little while ago, pay them")
+}
+
+private notify(msg) {
+    if (phone) {
+        sendSms(phone, msg)
+    	log.info "Sent SMS '$msg' to $phone"
+    }
+}
