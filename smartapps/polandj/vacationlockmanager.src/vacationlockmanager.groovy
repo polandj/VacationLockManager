@@ -99,7 +99,7 @@ private addCode(data) {
     if (!slot) {
     	slot = findEmptySlot()
     }
-    //lock.setCode(slot, code, name)
+    lock.setCode(slot, code, name)
     notify("Set code '$code' for $name in slot $slot")
 	log.debug "Set code $name = $code in slot $slot"
 }
@@ -111,7 +111,7 @@ private delCode(data) {
 
 	def slot = findSlotNamed(name)
     if (slot) {
-    	//lock.deleteCode(slot)
+    	lock.deleteCode(slot)
     	notify("Deleted code for $name in slot $slot")
     } else {
     	notify("Tried to delete code for $name, but it was already deleted")
@@ -166,27 +166,12 @@ def addReservation() {
     	log.error "Check-out is in the past! $delOnDate < $now"
     }
     
-	/*Date now = new Date();
-    now.setTime(now.getTime() + 5000);
-    runOnce(now, addCode, [data:request.JSON])
-    now.setTime(now.getTime() + 25000);
-    runOnce(now, delCode, [data:request.JSON])*/
-    
-    /*def df = new java.text.SimpleDateFormat("MMM dd, yyyy")
-	df.setLenient(false)
-	def parsed = df.parse("Sep 18, 2018")
-    log.debug df.parse("Aug 22, 2019")
-    log.debug df.parse("Jul 1, 2019")*/
-    
-	/*def name = request.JSON?.name
-    def phone = request.JSON?.phone
+    def name = request.JSON?.name
     def checkin = request.JSON?.checkin
     def checkout = request.JSON?.checkout
-    def lockCodes = lock.currentValue("lockCodes")
-
-	lock.setCode(10, "1234", "API")*/
 
 	log.debug "Posted a new reservation"
+    notify("Lock code scheduled for $name, staying $checkin to $checkout")
 }
 
 private cleanersCame() {
