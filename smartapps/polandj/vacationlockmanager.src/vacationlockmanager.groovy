@@ -17,11 +17,11 @@ definition(
     name: "VacationLockManager",
     namespace: "polandj",
     author: "Jonathan Poland",
-    description: "Exposes a web API for calling from zapier to automatically add and remove user lock codes to a zwave lock based on the users checkin and checkout dates.",
+    description: "Exposes a web API for calling from zapier to automatically add and remove user lock codes to a zwave/zigbee lock based on the users checkin and checkout dates.",
     category: "Safety & Security",
-    iconUrl: "https://s3.amazonaws.com/smartapp-icons/Convenience/Cat-Convenience.png",
-    iconX2Url: "https://s3.amazonaws.com/smartapp-icons/Convenience/Cat-Convenience@2x.png",
-    iconX3Url: "https://s3.amazonaws.com/smartapp-icons/Convenience/Cat-Convenience@2x.png")
+    iconUrl: "http://cdn.device-icons.smartthings.com/Home/home3-icn.png",
+    iconX2Url: "http://cdn.device-icons.smartthings.com/Home/home3-icn@2x.png",
+    iconX3Url: "http://cdn.device-icons.smartthings.com/Home/home3-icn@3x.png")
 
 preferences {
     page(name: "pageOne", title: "API and locks", nextPage: "pageTwo", uninstall: true) {
@@ -37,7 +37,7 @@ preferences {
         	input "phone", "phone", title: "Send Text Messages To", required: false
         }
         section("Special code") {
-        	input "notifycode", "text", title: "Code to notify on", required: false
+        	input "notifyuser", "text", title: "Username string to notify on", required: false
         	input "notifyafter", "number", title: "How many hours after using code to notify", defaultValue: 6, range: "0..12", required: true
         	input "notifytext", "text", title: "Text to send in notification", defaultValue: "Cleaners came, pay them", required: true
         }
@@ -74,12 +74,17 @@ def updated() {
 }
 
 def initialize() {
-	log.debug "VacationLockManager Initialized with url https://graph-na04-useast2.api.smartthings.com/api/smartapps/installations/${app.getId()}/reservation"
 	subscribe(lock, "codeReport", codeChange)
     subscribe(lock, "lock", codeUsed)
     runEvery1Hour(checkCodes)
+    log.debug "VacationLockManager Initialized with url https://graph-na04-useast2.api.smartthings.com/api/smartapps/installations/${app.getId()}/reservation"
 }
 
+/*
+ * Called whenever a code is changed in the lock.
+ * We use it to confirm our requested changes have been carried out on the lock. 
+ * (Won't currently work with multiple locks)
+ */
 def codeChange(evt) {
     def slot = "$evt.value" as Integer
     def cachedname
@@ -94,6 +99,7 @@ def codeChange(evt) {
     log.debug "Code change for $slot: $username/$cachedname"
     if (username) {
     	if (username == cachedname) {
+        	log.info "User $cachedname addition confirmed"
         	notify("Added code for $username in slot $slot")
         	state[username].confirmed = true
         } else {
@@ -109,15 +115,26 @@ def codeChange(evt) {
    
 }
 
+/*
+ * Called whenever the lock is locked or unlocked.
+ * We use this to optionally monitor for unlocking by a specified user and then notifying.
+ */
 def codeUsed(evt) {
     if(evt.value == "unlocked" && evt.data) {
         def codeData = new JsonSlurper().parseText(evt.data)
-        if (notifycode && notifyCode == codeData.usedCode) {
+        def username = findNameForSlot(codeData.usedCode)
+        log.debug "Unlocked by $username [$codeData.usedCode]"
+        if (notifyuser && username.toLowerCase().contains(notifyuser)) {
+        	log.debug "Notify soon about unlocked done by $username"
         	runIn(notifyAfter * 3600, notifyCodeUsed)
         }
     }
 }
 
+/*
+ * Tries to set the code and name on the lock.
+ * We confirm the addition in the codeChanged callback.
+ */
 def addCode(data) {
 	def name = data?.name
     def phone = data?.phone
@@ -132,6 +149,10 @@ def addCode(data) {
 	log.debug "Setting code $name = $code in slot $slot"
 }
 
+/*
+ * Tries to remove the code from the lock.
+ * We confirm the addition in the codeChanged callback.
+ */
 def delCode(data) {
 	def name = data?.name
 
@@ -146,6 +167,9 @@ def delCode(data) {
     }
 }
 
+/* Given a user, find the slot with that name.
+ * Returns 0 on not found, since the slots are 1-indexed (1-30)
+ */
 def findSlotNamed(user) {
 	def lockCodes = lock.currentValue("lockCodes").first()
     def codeData = new JsonSlurper().parseText(lockCodes)
@@ -153,25 +177,34 @@ def findSlotNamed(user) {
     if (x) {
     	log.debug "User $user is in slot $x"
    	}
-    return x
+    return x as Integer
 }
 
+/*
+ * Find the user associated with a given slot
+ * Returns the name or null if no slot or name
+ */
 def findNameForSlot(slot) {
 	def lockCodes = lock.currentValue("lockCodes").first()
     def codeData = new JsonSlurper().parseText(lockCodes)
-	def x = codeData.find{ it.key == slot }?.value
+	def x = codeData.find{ it.key == slot as String}?.value
     if (x) {
     	log.debug "User $x is in slot $slot"
    	}
     return x
 }
 
+/*
+ * Finds an empty slot
+ * We use this when we're adding a new code to find where to put it.
+ * We start at the max code ID (30) and work backwards.
+ */
 def findEmptySlot() {
 	def lockCodes = lock.currentValue("lockCodes").first()
     def codeData = new JsonSlurper().parseText(lockCodes)
     def maxCodes = lock.currentValue("maxCodes").first().toInteger()
     def emptySlot = null
-    for (def i = 1; i <= maxCodes; i++) {
+    for (def i = maxCodes; i > 0; i--) {
     	if (!codeData.get("$i")) {
         	emptySlot = i
             break
@@ -181,64 +214,77 @@ def findEmptySlot() {
     return emptySlot
 }
 
+/*
+ * Return the number of milliseconds in the given number of hours
+ */
+def millis(hours) {
+	return (hours * 3600000)
+}
+
+/*
+ * Called every hour, checks that the state of the lock matches our desired state.
+ * Sometimes set/delete operations need to be retried on the lock, this does that.
+ */
 def checkCodes() {
-	log.debug "Checking codes"
-    def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ")
+	log.debug "Periodic check of users and codes.."
+    def sdf = new java.text.SimpleDateFormat("MMM dd, yyyy")
     sdf.setTimeZone(location.getTimeZone());
+    def ltf = new java.text.SimpleDateFormat ("yyyy-MM-dd@HH:mm");
+    ltf.setTimeZone(location.getTimeZone());
 	Date now = new Date();
-	for ( entry in state ) {
-    	log.debug "Check ${entry.key} -> ${entry.value}"
-        def addOnDate = sdf.parse(entry.value.addondate)
-        def delOnDate = sdf.parse(entry.value.delondate)
+    state.each { key, value ->
+        def addOnDate = sdf.parse(value.checkin)
+        addOnDate.setTime(addOnDate.getTime() + millis(checkinhour) - millis(hoursbefore))
+        def delOnDate = sdf.parse(value.checkout)
+        delOnDate.setTime(delOnDate.getTime() + millis(checkouthour) + millis(hoursafter))
         if (now < addOnDate) {
-        	// DO nothing
+        	log.debug "${key}: Early (Now: ${ltf.format(now)} < Add: ${ltf.format(addOnDate)})"
         } else if (now > addOnDate && now < delOnDate) {
-        	if (!entry.value.confirmed) {
-            	addCode(entry.value)
+        	log.debug "${key}: Active (Add: ${ltf.format(addOnDate)} < Now: ${ltf.format(now)} < Del: ${ltf.format(delOnDate)})"
+        	if (!value.confirmed) {
+            	// Can't call directly because it manipulates state (which we're iterating)
+            	runIn(1, addCode, [data: value])
             }
         } else {
-        	delCode(entry.value)
+        	log.debug "${key}: Expired (Del: ${ltf.format(delOnDate)} < Now: ${ltf.format(now)})"
+            // Can't call directly because it manipulates state (which we're iterating)
+            runIn(1, delCode, [data: value])
         }
     }
 }
 
+/*
+ * The callback for our one API endpoint.  This is called to inform us of a new reservation.
+ * Request must specify name, phone, checkin, checkout params
+ */
 def addReservation() {
-	Date now = new Date();
-	def sdf = new java.text.SimpleDateFormat("MMM dd, yyyy")
-    sdf.setTimeZone(location.getTimeZone());
-    
-    def addOnDate = sdf.parse(request.JSON?.checkin)
-    addOnDate.setTime(addOnDate.getTime() + (checkinhour * 3600000) - (hoursbefore * 3600000))
-    if (addOnDate > now) {
-    	runOnce(addOnDate, addCode, [data:request.JSON])
-    }
-    
-    def delOnDate = sdf.parse(request.JSON?.checkout)
-    delOnDate.setTime(delOnDate.getTime() + (checkouthour * 3600000) + (hoursafter * 3600000))
-    if (delOnDate > now) {
-        runOnce(delOnDate, delCode, [data:request.JSON])
-    }
-
-    def name = request.JSON?.name
+	def name = request.JSON?.name
     def phone = request.JSON?.phone
     def checkin = request.JSON?.checkin
     def checkout = request.JSON?.checkout
     
+    if (!name || !phone || !checkin || !checkout) {
+    	httpError(400, "Must specify name, phone, checkin, AND checkout parameters")
+    }
+    
     state[name] = [name: name, phone: phone, 
-    			   checkin: checkin, checkout: checkout, 
-                   addondate: addOnDate, delondate: delOnDate, 
+    			   checkin: checkin, checkout: checkout,
                    slot: 0, confirmed: false]
 
-	def df = new java.text.SimpleDateFormat ("yyyy-MM-dd@HH:mm");
-    df.setTimeZone(location.getTimeZone());
-	log.debug "Posted a new reservation.  ${df.format(addOnDate)} -> ${df.format(delOnDate)}. $state"
-    notify("Lock code scheduled for $name, staying $checkin to $checkout")
+	log.info "Lock code scheduled for $name, staying $checkin to $checkout"
+    checkCodes()
 }
 
+/*
+ * Called to send notification text after notifyuser unlocked the lock
+ */
 def notifyCodeUsed() {
 	notify(notifytext)
 }
 
+/*
+ * Actually sends the SMS, if a phone is configured
+ */
 def notify(msg) {
     if (phone) {
         sendSms(phone, msg)
