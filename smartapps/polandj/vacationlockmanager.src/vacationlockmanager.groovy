@@ -28,18 +28,19 @@ preferences {
 		section("Info") {
     		paragraph title: "API ID", app.getId()
     	}
-		section("Locks") {
-    		input "lock","capability.lockCodes", title: "Locks", multiple: true
+		section("Lock") {
+    		input "lock","capability.lockCodes", title: "Lock", multiple: false
         }
     }
     page(name: "pageTwo", title: "Notifications", nextPage: "pageThree") {
     	section("Phone") {
-        	input "phone", "phone", title: "Send Text Messages To", required: false
+        	input "ownersms", "phone", title: "Owner SMS Number", required: false
+            input "cleanersms", "phone", title: "Cleaners SMS Number", required: false
         }
         section("Special code") {
-        	input "notifyuser", "text", title: "Username string to notify on", required: false
+        	input "notifyuser", "text", title: "Username string to notify on", defaultValue: "cleaners", required: false
         	input "notifyafter", "number", title: "How many hours after using code to notify", defaultValue: 6, range: "0..12", required: true
-        	input "notifytext", "text", title: "Text to send in notification", defaultValue: "Cleaners came, pay them", required: true
+        	input "notifytext", "text", title: "Text to send in notification", defaultValue: "Cleaners came today, please send payment!", required: true
         }
     }
     page(name: "pageThree", title: "Options", install: true) {
@@ -48,8 +49,8 @@ preferences {
         	input "checkouthour", "number", title: "Check out time (hour of day)", defaultValue: 11, range: "0..23", required: true
         }
         section("Code lifetime") {
-        	input "hoursbefore", "number", title: "Add code this many hours before checkin", defaultValue:8, range: "1..48", required: true
-        	input "hoursafter", "number", title: "Delete code this many hours after checkout", defaultValue: 5, range: "1..48", required: true
+        	input "hoursbefore", "number", title: "Add code this many hours before checkin", defaultValue: 23, range: "1..48", required: true
+        	input "hoursafter", "number", title: "Delete code this many hours after checkout", defaultValue: 6, range: "1..48", required: true
         }
     }
 }
@@ -83,7 +84,6 @@ def initialize() {
 /*
  * Called whenever a code is changed in the lock.
  * We use it to confirm our requested changes have been carried out on the lock. 
- * (Won't currently work with multiple locks)
  */
 def codeChange(evt) {
     def slot = "$evt.value" as Integer
@@ -100,14 +100,14 @@ def codeChange(evt) {
     if (username) {
     	if (username == cachedname) {
         	log.info "User $cachedname addition confirmed"
-        	notify("Added code for $username in slot $slot")
+        	notify(ownersms, "Added code for $username in slot $slot")
         	state[username].confirmed = true
         } else {
         	log.error "Code name mismatch: $username vs $cachedname"
         }
     } else {
     	if (cachedname) {
-        	notify("Deleted code for $cachedname in slot $slot")
+        	notify(ownersms, "Deleted code for $cachedname in slot $slot")
         	state.remove(cachedname)
             log.info "User $cachedname removed from cache"
         }
@@ -167,13 +167,21 @@ def delCode(data) {
     }
 }
 
+/* 
+ * Get current lock codes from the lock as a map
+ */
+def getLockCodes() {
+	def lockCodes = lock.currentValue("lockCodes")
+    def codeData = new JsonSlurper().parseText(lockCodes)
+    return codeData
+}
+
 /* Given a user, find the slot with that name.
  * Returns 0 on not found, since the slots are 1-indexed (1-30)
  */
 def findSlotNamed(user) {
-	def lockCodes = lock.currentValue("lockCodes").first()
-    def codeData = new JsonSlurper().parseText(lockCodes)
-	def x = codeData.find{ it.value == user }?.key
+	def lockCodes = getLockCodes()
+	def x = lockCodes.find{ it.value == user }?.key
     if (x) {
     	log.debug "User $user is in slot $x"
    	}
@@ -185,9 +193,8 @@ def findSlotNamed(user) {
  * Returns the name or null if no slot or name
  */
 def findNameForSlot(slot) {
-	def lockCodes = lock.currentValue("lockCodes").first()
-    def codeData = new JsonSlurper().parseText(lockCodes)
-	def x = codeData.find{ it.key == slot as String}?.value
+	def lockCodes = getLockCodes()
+    def x = lockCodes.find{ it.key == slot as String}?.value
     if (x) {
     	log.debug "User $x is in slot $slot"
    	}
@@ -200,12 +207,11 @@ def findNameForSlot(slot) {
  * We start at the max code ID (30) and work backwards.
  */
 def findEmptySlot() {
-	def lockCodes = lock.currentValue("lockCodes").first()
-    def codeData = new JsonSlurper().parseText(lockCodes)
-    def maxCodes = lock.currentValue("maxCodes").first().toInteger()
+	def lockCodes = getLockCodes()
+    def maxCodes = lock.currentValue("maxCodes").toInteger()
     def emptySlot = null
     for (def i = maxCodes; i > 0; i--) {
-    	if (!codeData.get("$i")) {
+    	if (!lockCodes.get("$i")) {
         	emptySlot = i
             break
         }
@@ -262,16 +268,18 @@ def addReservation() {
     def phone = request.JSON?.phone
     def checkin = request.JSON?.checkin
     def checkout = request.JSON?.checkout
+    def guests = request.JSON?.guests
     
-    if (!name || !phone || !checkin || !checkout) {
-    	httpError(400, "Must specify name, phone, checkin, AND checkout parameters")
+    if (!name || !phone || !checkin || !checkout || !guests) {
+    	httpError(400, "Must specify name, phone, checkin, checkout, AND guests parameters")
     }
     
     state[name] = [name: name, phone: phone, 
     			   checkin: checkin, checkout: checkout,
                    slot: 0, confirmed: false]
 
-	log.info "Lock code scheduled for $name, staying $checkin to $checkout"
+	log.info "Lock code scheduled for $name, $guests staying $checkin to $checkout"
+    notify(cleanersms, "Reminder for ${location.name}: $guests staying $checkin to $checkout")
     checkCodes()
 }
 
@@ -279,15 +287,15 @@ def addReservation() {
  * Called to send notification text after notifyuser unlocked the lock
  */
 def notifyCodeUsed() {
-	notify(notifytext)
+	notify(ownersms, notifytext)
 }
 
 /*
- * Actually sends the SMS, if a phone is configured
+ * Actually sends the SMS, if a ownersms is configured
  */
-def notify(msg) {
-    if (phone) {
-        sendSms(phone, msg)
-    	log.info "Sent SMS '$msg' to $phone"
+def notify(sms, msg) {
+    if (sms) {
+        sendSms(sms, msg)
+    	log.info "Sent SMS '$msg' to $sms"
     }
 }
