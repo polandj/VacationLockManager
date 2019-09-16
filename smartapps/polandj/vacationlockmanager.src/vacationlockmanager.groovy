@@ -1,7 +1,7 @@
 /**
  *  VacationLockManager
  *
- *  Copyright 2018 Jonathan Poland
+ *  Copyright 2018-2020 Jonathan Poland
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  *  in compliance with the License. You may obtain a copy of the License at:
@@ -33,17 +33,18 @@ preferences {
         }
     }
     page(name: "pageTwo", title: "Notifications", nextPage: "pageThree") {
-    	section("Phone") {
+    	section() {
         	input "ownersms", "phone", title: "Owner SMS Number", required: false
             input "cleanersms", "phone", title: "Cleaners SMS Number", required: false
         }
-        section("Special code") {
-        	input "notifyuser", "text", title: "Username string to notify on", defaultValue: "cleaners", required: false
-        	input "notifyafter", "number", title: "How many hours after using code to notify", defaultValue: 6, range: "0..12", required: true
-        	input "notifytext", "text", title: "Text to send in notification", defaultValue: "Cleaners came today, please send payment!", required: true
+        section("Twilio") {
+        	input "twacct", "text", title: "Account", required: false
+            input "twsid", "text", title: "SID", required: false
+            input "twtok", "text", title: "Token", required: false
+            input "twphone", "phone", title: "Phone", required: false
         }
     }
-    page(name: "pageThree", title: "Options", install: true) {
+    page(name: "pageThree", title: "Options", nextPage: "selectRoutines") {
     	section("Check in/out") {
         	input "checkinhour", "number", title: "Check in time (hour of day)", defaultValue: 17, range: "0..23", required: true
         	input "checkouthour", "number", title: "Check out time (hour of day)", defaultValue: 11, range: "0..23", required: true
@@ -52,6 +53,24 @@ preferences {
         	input "hoursbefore", "number", title: "Add code this many hours before checkin", defaultValue: 23, range: "1..48", required: true
         	input "hoursafter", "number", title: "Delete code this many hours after checkout", defaultValue: 6, range: "1..48", required: true
         }
+    }
+    page(name: "selectRoutines", install: true)
+}
+
+def selectRoutines() {
+    dynamicPage(name: "selectRoutines", title: "Select Routines to Execute") {
+        // get the available actions
+        def actions = location.helloHome?.getPhrases()*.label
+        if (actions) {
+        	// sort them alphabetically
+            actions.sort()
+            section("Rented Routine") {
+                input "rentedroutine", "enum", title: "Rented routine", options: actions
+            }
+            section("Vacant Routine") {
+                input "vacantroutine", "enum", title: "Vacant routine", options: actions
+           	}
+		}
     }
 }
 
@@ -75,45 +94,12 @@ def updated() {
 }
 
 def initialize() {
-	subscribe(lock, "codeReport", codeChange)
     subscribe(lock, "lock", codeUsed)
+    subscribe(location, "routineExecuted", routineRan)
     runEvery1Hour(checkCodes)
     log.debug "VacationLockManager Initialized with url https://graph-na04-useast2.api.smartthings.com/api/smartapps/installations/${app.getId()}/reservation"
 }
 
-/*
- * Called whenever a code is changed in the lock.
- * We use it to confirm our requested changes have been carried out on the lock. 
- */
-def codeChange(evt) {
-    def slot = "$evt.value" as Integer
-    def cachedname
-    for (entry in state) {
-    	if (entry.value.slot == slot) {
-        	cachedname = entry.key
-        } else {
-        	log.debug "$entry.value.slot != $slot"
-        }
-    }
-    def username = findNameForSlot(slot)
-    log.debug "Code change for $slot: $username/$cachedname"
-    if (username) {
-    	if (username == cachedname) {
-        	log.info "User $cachedname addition confirmed"
-        	notify(ownersms, "Added code for $username in slot $slot")
-        	state[username].confirmed = true
-        } else {
-        	log.error "Code name mismatch: $username vs $cachedname"
-        }
-    } else {
-    	if (cachedname) {
-        	notify(ownersms, "Deleted code for $cachedname in slot $slot")
-        	state.remove(cachedname)
-            log.info "User $cachedname removed from cache"
-        }
-    }
-   
-}
 
 /*
  * Called whenever the lock is locked or unlocked.
@@ -123,17 +109,18 @@ def codeUsed(evt) {
     if(evt.value == "unlocked" && evt.data) {
         def codeData = new JsonSlurper().parseText(evt.data)
         def username = findNameForSlot(codeData.usedCode)
-        log.debug "Unlocked by $username [$codeData.usedCode]"
-        if (notifyuser && username.toLowerCase().contains(notifyuser)) {
-        	log.debug "Notify soon about unlocked done by $username"
-        	runIn(notifyAfter * 3600, notifyCodeUsed)
+        if(username && state[username] && !state[username].welcomed) {
+        	def phone = state[username].phone
+        	twilio_sms(phone, "Welcome to Once Upon a Blue Moon, $username! Please let me know if you need anything as you get settled in.")
+            notify(ownersms, "$username has checked in")
+            state[username].welcomed = true
         }
     }
 }
 
 /*
  * Tries to set the code and name on the lock.
- * We confirm the addition in the codeChanged callback.
+ * We'll confirm the change in the periodic check.
  */
 def addCode(data) {
 	def name = data?.name
@@ -143,15 +130,20 @@ def addCode(data) {
 	def slot = findSlotNamed(name)
     if (!slot) {
     	slot = findEmptySlot()
+        lock.setCode(slot, code, name)
+        state[name].slot = slot
+		log.debug "Setting code $name = $code in slot $slot"
     }
-    lock.setCode(slot, code, name)
-    state[name].slot = slot
-	log.debug "Setting code $name = $code in slot $slot"
+    // Run rented routine if now occupied
+    def sz = state.size()
+    if (sz == 1) {
+    	runIn(1, runRentedRoutine)
+    }
 }
 
 /*
  * Tries to remove the code from the lock.
- * We confirm the addition in the codeChanged callback.
+ * We confirm the addition in the codeChange callback.
  */
 def delCode(data) {
 	def name = data?.name
@@ -162,8 +154,13 @@ def delCode(data) {
         log.debug "Deleting code for $name in slot $slot"
     } else {
         state.remove(name)
-    	notify("Tried to delete code for $name, but it was already deleted")
-    	log.info "Tried to delete for $name, but it was already deleted"
+    	notify(ownersms, "Tried to delete code for $name, but it was already deleted")
+    }
+    
+    // Run vacant routine if not occupied
+    def sz = state.size()
+    if (sz == 0) {
+    	runIn(1, runVacantRoutine)
     }
 }
 
@@ -241,20 +238,28 @@ def checkCodes() {
     state.each { key, value ->
         def addOnDate = sdf.parse(value.checkin)
         addOnDate.setTime(addOnDate.getTime() + millis(checkinhour) - millis(hoursbefore))
+        def warnOnDate = sdf.parse(value.checkin)
+        warnOnDate.setTime(warnOnDate.getTime() + millis(checkinhour) - millis(3))
         def delOnDate = sdf.parse(value.checkout)
         delOnDate.setTime(delOnDate.getTime() + millis(checkouthour) + millis(hoursafter))
         if (now < addOnDate) {
         	log.debug "${key}: Early (Now: ${ltf.format(now)} < Add: ${ltf.format(addOnDate)})"
         } else if (now > addOnDate && now < delOnDate) {
         	log.debug "${key}: Active (Add: ${ltf.format(addOnDate)} < Now: ${ltf.format(now)} < Del: ${ltf.format(delOnDate)})"
-        	if (!value.confirmed) {
+            if (!findSlotNamed(value.name)) {
             	// Can't call directly because it manipulates state (which we're iterating)
             	runIn(1, addCode, [data: value])
+            	// Notify if it's getting close to checkin and still not added
+                if (now > warnOnDate) {
+               		notify(ownersms, "${value.name} is checking on soon, but lock code hasn't been added yet!")
+                }
             }
         } else {
         	log.debug "${key}: Expired (Del: ${ltf.format(delOnDate)} < Now: ${ltf.format(now)})"
-            // Can't call directly because it manipulates state (which we're iterating)
-            runIn(1, delCode, [data: value])
+            if (findSlotNamed(value.name)) {
+            	// Can't call directly because it manipulates state (which we're iterating)
+            	runIn(1, delCode, [data: value])
+            }
         }
     }
 }
@@ -273,29 +278,62 @@ def addReservation() {
     if (!name || !phone || !checkin || !checkout || !guests) {
     	httpError(400, "Must specify name, phone, checkin, checkout, AND guests parameters")
     }
-    
+    phone = "+" + phone.replaceAll("[^\\d]", "");
     state[name] = [name: name, phone: phone, 
     			   checkin: checkin, checkout: checkout,
-                   slot: 0, confirmed: false]
+                   slot: 0, welcomed: false]
 
 	log.info "Lock code scheduled for $name, $guests staying $checkin to $checkout"
-    notify(cleanersms, "Reminder for ${location.name}: $guests staying $checkin to $checkout")
+    twilio_sms(cleanersms, "Cleaning reminder for ${location.name}: $guests staying $checkin to $checkout")
     checkCodes()
 }
 
 /*
- * Called to send notification text after notifyuser unlocked the lock
- */
-def notifyCodeUsed() {
-	notify(ownersms, notifytext)
-}
-
-/*
- * Actually sends the SMS, if a ownersms is configured
+ * Actually sends the SMS, if a sms is configured
  */
 def notify(sms, msg) {
     if (sms) {
         sendSms(sms, msg)
-    	log.info "Sent SMS '$msg' to $sms"
+    }
+}
+
+/*
+ * Send SMS using Twilio API
+ */
+def twilio_sms(sms, msg) {
+	if (sms) {
+    	String charset = "UTF-8"
+		String url = String.format("https://%s:%s@api.twilio.com/2010-04-01/Accounts/%s/Messages.json",
+        						   URLEncoder.encode(twsid, charset),
+                                   URLEncoder.encode(twtok, charset),
+                                   URLEncoder.encode(twacct, charset))
+    	String query = String.format("To=%s&Body=%s&From=%s", 
+ 	    							 URLEncoder.encode(sms, charset),
+	     							 URLEncoder.encode(msg, charset),
+                                     twphone)
+                         
+		try {
+			httpPost(url, query) { resp ->
+        		log.debug "response data: ${resp.data}"
+    		}
+        } catch (e) {
+        	notify(ownersms, "Problem sending twilio sms to $sms: $e")
+		}
+    }
+}
+
+def routineRan(evt) {
+    notify(ownersms, "${location.name} ran routine ${evt.displayName}")
+}
+
+def runRentedRoutine() {
+	if(rentedroutine) {
+		location.helloHome?.execute(rentedroutine)
+    }
+}
+
+def runVacantRoutine() {
+	if (vacantroutine) {
+	 	location.helloHome?.execute(vacantroutine)
     }
 }
