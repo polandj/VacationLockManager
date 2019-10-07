@@ -80,6 +80,16 @@ mappings {
       POST: "addReservation"
     ]
   }
+  path("/cancel") {
+    action: [
+      POST: "delReservation"
+    ]
+  }
+  path("/who") {
+    action: [
+      GET: "listReservations"
+    ]
+  }
 }
 
 import groovy.json.JsonSlurper
@@ -125,7 +135,7 @@ def codeUsed(evt) {
 def addCode(data) {
 	def name = data?.name
     def phone = data?.phone
-	def code = phone[-4..-1]
+	def code = phone[-7..-1]
 
 	def slot = findSlotNamed(name)
     if (!slot) {
@@ -143,7 +153,6 @@ def addCode(data) {
 
 /*
  * Tries to remove the code from the lock.
- * We confirm the addition in the codeChange callback.
  */
 def delCode(data) {
 	def name = data?.name
@@ -152,16 +161,27 @@ def delCode(data) {
     if (slot) {
     	lock.deleteCode(slot)
         log.debug "Deleting code for $name in slot $slot"
+        // Run vacant routine if this is last one
+        if (state.size() == 1) {
+        	runIn(1, runVacantRoutine)
+        }
     } else {
+    	// We delete from state the second time around,
+        // once we know it's really gone from the lock
         state.remove(name)
-    	notify(ownersms, "Tried to delete code for $name, but it was already deleted")
     }
-    
-    // Run vacant routine if not occupied
-    def sz = state.size()
-    if (sz == 0) {
-    	runIn(1, runVacantRoutine)
-    }
+}
+
+/*
+ * Sends a notification to cleaners and notes it in state
+ */
+ def notifyCleaners(data) {
+	def name = data?.name
+    def guests = data?.guests
+    def checkout = data?.checkout
+
+	twilio_sms(cleanersms, "Upcoming cleaning reminder for ${location.name}: ${guests} guests check out on ${checkout}")
+    state[name].cleaners_notified = true
 }
 
 /* 
@@ -242,6 +262,8 @@ def checkCodes() {
         warnOnDate.setTime(warnOnDate.getTime() + millis(checkinhour) - millis(3))
         def delOnDate = sdf.parse(value.checkout)
         delOnDate.setTime(delOnDate.getTime() + millis(checkouthour) + millis(hoursafter))
+        def cleanerNotifyDate = sdf.parse(value.checkout)
+        cleanerNotifyDate.setTime(cleanerNotifyDate.getTime() + millis(checkouthour) - millis(48))
         if (now < addOnDate) {
         	log.debug "${key}: Early (Now: ${ltf.format(now)} < Add: ${ltf.format(addOnDate)})"
         } else if (now > addOnDate && now < delOnDate) {
@@ -251,22 +273,26 @@ def checkCodes() {
             	runIn(1, addCode, [data: value])
             	// Notify if it's getting close to checkin and still not added
                 if (now > warnOnDate) {
-               		notify(ownersms, "${value.name} is checking on soon, but lock code hasn't been added yet!")
+               		notify(ownersms, "${value.name} is checking in soon, but lock code hasn't been added yet!")
                 }
+            }
+            // Remind cleaners a couple days before guests check out
+            if (now > cleanerNotifyDate && !value.cleaners_notified) {
+            	// Can't call directly because it manipulates state (which we're iterating)
+            	runIn(1, notifyCleaners, [data: value])
             }
         } else {
         	log.debug "${key}: Expired (Del: ${ltf.format(delOnDate)} < Now: ${ltf.format(now)})"
-            if (findSlotNamed(value.name)) {
-            	// Can't call directly because it manipulates state (which we're iterating)
-            	runIn(1, delCode, [data: value])
-            }
+            // Can't call directly because it manipulates state (which we're iterating)
+            runIn(1, delCode, [data: value])
         }
     }
 }
 
 /*
- * The callback for our one API endpoint.  This is called to inform us of a new reservation.
- * Request must specify name, phone, checkin, checkout params
+ * The callback for our API endpoint to add reservations.  This is called (from zapier) to inform 
+ * us of a new reservation.
+ * Request MUST specify name, phone, checkin, checkout, guests params
  */
 def addReservation() {
 	def name = request.JSON?.name
@@ -279,13 +305,36 @@ def addReservation() {
     	httpError(400, "Must specify name, phone, checkin, checkout, AND guests parameters")
     }
     phone = "+" + phone.replaceAll("[^\\d]", "");
-    state[name] = [name: name, phone: phone, 
+    state[name] = [name: name, phone: phone, guests: guests,
     			   checkin: checkin, checkout: checkout,
-                   slot: 0, welcomed: false]
+                   slot: 0, welcomed: false, cleaners_notified: false]
 
 	log.info "Lock code scheduled for $name, $guests staying $checkin to $checkout"
-    twilio_sms(cleanersms, "Cleaning reminder for ${location.name}: $guests staying $checkin to $checkout")
+    twilio_sms(cleanersms, "Please schedule a new cleaning for ${location.name} on ${checkout}. There are ${guests} guests staying ${checkin} to ${checkout}")
     checkCodes()
+}
+
+def delReservation() {
+    def phone = request.JSON?.phone
+    def retval = "No such number"
+    
+    if (!phone) {
+    	httpError(400, "Must specify phone parameter")
+    }
+    phone = "+" + phone.replaceAll("[^\\d]", "");
+    state.each { key, value ->
+    	if (value.phone == phone) {
+        	notify(ownersms, "${value.name} manually deleted")
+            twilio_sms(cleanersms, "Please cancel the cleaning scheduled for ${location.name} on ${value.checkout}.  The guests cancelled")
+    		runIn(1, delCode, [data: value])
+            retval = "Deleted ${value.name}"
+        }
+    }
+    return [response: retval]
+}
+
+def listReservations() {
+  return state
 }
 
 /*
@@ -310,7 +359,7 @@ def twilio_sms(sms, msg) {
     	String query = String.format("To=%s&Body=%s&From=%s", 
  	    							 URLEncoder.encode(sms, charset),
 	     							 URLEncoder.encode(msg, charset),
-                                     twphone)
+                                     URLEncoder.encode(twphone, charset))
                          
 		try {
 			httpPost(url, query) { resp ->
