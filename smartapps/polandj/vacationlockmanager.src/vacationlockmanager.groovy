@@ -121,7 +121,7 @@ def codeUsed(evt) {
         def username = findNameForSlot(codeData.usedCode)
         if(username && state[username] && !state[username].welcomed) {
         	def phone = state[username].phone
-        	twilio_sms(phone, "Welcome to Once Upon a Blue Moon, $username! Please let me know if you need anything as you get settled in.")
+        	twilio_sms(phone, "Welcome to ${location.name}, $username! Please let me know if you need anything as you get settled in.")
             notify(ownersms, "$username has checked in")
             state[username].welcomed = true
         }
