@@ -245,6 +245,46 @@ def millis(hours) {
 }
 
 /*
+ * Convert string date to a date object, if possible.  Null if not.
+ */
+def extractDate(date){
+    final List<String> dateFormats = ["MMM dd, yyyy", "MMM dd,yyyy"]
+    if (date instanceof Date) {
+        return date
+    }
+    for(String format: dateFormats) {
+        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat(format)
+        try {             
+            return sdf.parse(date)      
+        } 
+        catch (java.text.ParseException e) { }
+    }
+}
+
+/*
+ * Make sure phone numbers are complete
+ * (will not work correctly for non-US numbers)
+ */
+def normalizePhone(phone) {
+    try {
+        return ("+1" + phone.replaceAll("[^\\d]", "")[-10..-1])
+    } 
+    catch (StringIndexOutOfBoundsException) { }
+}
+
+/*
+ * Normalize how dates are output.
+ */
+def fmtDate(date) {
+    try {
+        return new java.text.SimpleDateFormat("MMMMM dd, yyyy").format(date)
+    }
+    catch (IllegalArgumentException) {
+        return date
+    }
+}
+
+/*
  * Called every hour, checks that the state of the lock matches our desired state.
  * Sometimes set/delete operations need to be retried on the lock, this does that.
  */
@@ -256,13 +296,13 @@ def checkCodes() {
     ltf.setTimeZone(location.getTimeZone());
 	Date now = new Date();
     state.each { key, value ->
-        def addOnDate = sdf.parse(value.checkin)
+        def addOnDate = extractDate(value.checkin)
         addOnDate.setTime(addOnDate.getTime() + millis(checkinhour) - millis(hoursbefore))
-        def warnOnDate = sdf.parse(value.checkin)
+        def warnOnDate = extractDate(value.checkin)
         warnOnDate.setTime(warnOnDate.getTime() + millis(checkinhour) - millis(3))
-        def delOnDate = sdf.parse(value.checkout)
+        def delOnDate =  extractDate(value.checkout)
         delOnDate.setTime(delOnDate.getTime() + millis(checkouthour) + millis(hoursafter))
-        def cleanerNotifyDate = sdf.parse(value.checkout)
+        def cleanerNotifyDate = extractDate(value.checkout)
         cleanerNotifyDate.setTime(cleanerNotifyDate.getTime() + millis(checkouthour) - millis(48))
         if (now < addOnDate) {
         	log.debug "${key}: Early (Now: ${ltf.format(now)} < Add: ${ltf.format(addOnDate)})"
@@ -304,13 +344,24 @@ def addReservation() {
     if (!name || !phone || !checkin || !checkout || !guests) {
     	httpError(400, "Must specify name, phone, checkin, checkout, AND guests parameters")
     }
-    phone = "+" + phone.replaceAll("[^\\d]", "");
+    phone = normalizePhone(phone)
+    if (!phone) {
+    	httpError(400, "Invalid phone number")
+    }
+    checkin = extractDate(checkin)
+    if (!checkin) {
+    	httpError(400, "Invalid check-in date")
+    }
+    checkout = extractDate(checkout)
+    if (!checkout) {
+    	httpError(400, "Invalid check-out date")
+    }
     state[name] = [name: name, phone: phone, guests: guests,
     			   checkin: checkin, checkout: checkout,
                    slot: 0, welcomed: false, cleaners_notified: false]
 
 	log.info "Lock code scheduled for $name, $guests staying $checkin to $checkout"
-    twilio_sms(cleanersms, "Please schedule a new cleaning for ${location.name} on ${checkout}. There are ${guests} guests staying ${checkin} to ${checkout}")
+    twilio_sms(cleanersms, "Please schedule a new cleaning for ${location.name} on ${fmtDate(checkout)}. There are ${guests} guests staying ${fmtDate(checkin)} to ${fmtDate(checkout)}")
     checkCodes()
 }
 
@@ -321,11 +372,14 @@ def delReservation() {
     if (!phone) {
     	httpError(400, "Must specify phone parameter")
     }
-    phone = "+" + phone.replaceAll("[^\\d]", "");
+    phone = normalizePhone(phone)
+    if (!phone) {
+    	httpError(400, "Invalid phone number")
+    }
     state.each { key, value ->
     	if (value.phone == phone) {
         	notify(ownersms, "${value.name} manually deleted")
-            twilio_sms(cleanersms, "Please cancel the cleaning scheduled for ${location.name} on ${value.checkout}.  The guests cancelled")
+            twilio_sms(cleanersms, "Please cancel the cleaning scheduled for ${location.name} on ${fmtDate(value.checkout)}.  The guests cancelled.")
     		runIn(1, delCode, [data: value])
             retval = "Deleted ${value.name}"
         }
@@ -351,13 +405,14 @@ def notify(sms, msg) {
  */
 def twilio_sms(sms, msg) {
 	if (sms) {
+    	String phone = normalizePhone(sms)
     	String charset = "UTF-8"
 		String url = String.format("https://%s:%s@api.twilio.com/2010-04-01/Accounts/%s/Messages.json",
         						   URLEncoder.encode(twsid, charset),
                                    URLEncoder.encode(twtok, charset),
                                    URLEncoder.encode(twacct, charset))
     	String query = String.format("To=%s&Body=%s&From=%s", 
- 	    							 URLEncoder.encode(sms, charset),
+ 	    							 URLEncoder.encode(phone, charset),
 	     							 URLEncoder.encode(msg, charset),
                                      URLEncoder.encode(twphone, charset))
                          
