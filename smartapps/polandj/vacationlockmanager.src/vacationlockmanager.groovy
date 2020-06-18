@@ -90,6 +90,11 @@ mappings {
       GET: "listReservations"
     ]
   }
+  path("/edit") {
+  	action: [
+      POST: "editReservation"
+    ]
+  }
 }
 
 import groovy.json.JsonSlurper
@@ -121,7 +126,7 @@ def codeUsed(evt) {
         def username = findNameForSlot(codeData.usedCode)
         if(username && state[username] && !state[username].welcomed) {
         	def phone = state[username].phone
-        	twilio_sms(phone, "Welcome to ${location.name}, $username! Please let me know if you need anything as you get settled in.")
+        	twilio_sms(phone, "Welcome to ${location.name}, ${fname(username)}! Please let me know if you need anything as you get settled in.")
             notify(ownersms, "$username has checked in")
             state[username].welcomed = true
         }
@@ -254,10 +259,12 @@ def extractDate(date){
     }
     for(String format: dateFormats) {
         java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat(format)
+        sdf.setTimeZone(location.getTimeZone())
         try {             
             return sdf.parse(date)      
         } 
         catch (java.text.ParseException e) { }
+        catch (java.lang.NullPointerException e) { }
     }
 }
 
@@ -285,15 +292,24 @@ def fmtDate(date) {
 }
 
 /*
+ * Print a first name from First Last
+ */
+def fname(name) {
+    try {
+        return name.trim().split(" ")[0]
+    } catch (Exception e) {
+        return name
+    }
+}
+
+/*
  * Called every hour, checks that the state of the lock matches our desired state.
  * Sometimes set/delete operations need to be retried on the lock, this does that.
  */
 def checkCodes() {
 	log.debug "Periodic check of users and codes.."
-    def sdf = new java.text.SimpleDateFormat("MMM dd, yyyy")
-    sdf.setTimeZone(location.getTimeZone());
-    def ltf = new java.text.SimpleDateFormat ("yyyy-MM-dd@HH:mm");
-    ltf.setTimeZone(location.getTimeZone());
+    def ltf = new java.text.SimpleDateFormat ("yyyy-MM-dd@HH:mm")
+    ltf.setTimeZone(location.getTimeZone())
 	Date now = new Date();
     state.each { key, value ->
         def addOnDate = extractDate(value.checkin)
@@ -391,6 +407,44 @@ def listReservations() {
   return state
 }
 
+def editReservation() {
+	def name = request.JSON?.name
+    def phone = normalizePhone(request.JSON?.phone)
+    def checkin = extractDate(request.JSON?.checkin)
+    def checkout = extractDate(request.JSON?.checkout)
+    def guests = request.JSON?.guests
+    def retval = "No such name"
+    
+    if (!name) {
+    	httpError(400, "Must specify a valid name parameter")
+    }
+    
+    def keyval = state[name]
+    if (keyval) {
+    	retval = "Edited ${name}: "
+    	if (phone && phone != keyval.phone) {
+        	if (slot) {
+            	httpError(400, "Cannot change phone because code already on lock")
+            } else {
+            	state[name].phone = phone
+            	retval = retval + " phone (${keyval.phone} -> ${phone})"
+            }
+        }
+        if (checkin && checkin != keyval.checkin) {
+        	state[name].checkin = checkin
+        	retval = retval + " checkin (${fmtDate(keyval.checkin)} -> ${fmtDate(checkin)})"
+        }
+        if (checkout && checkout != keyval.checkout) {
+        	state[name].checkout = checkout
+        	retval = retval + " checkout (${fmtDate(keyval.checkout)} -> ${fmtDate(checkout)})"
+        }
+        if (guests && guests != keyval.guests) {
+        	state[name].guests = guests
+        	retval = retval + " guests (${keyval.guests} -> ${guests})"
+        }
+    }
+    return [response: retval]
+}
 /*
  * Actually sends the SMS, if a sms is configured
  */
