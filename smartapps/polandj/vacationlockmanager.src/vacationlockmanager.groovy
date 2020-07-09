@@ -127,7 +127,7 @@ def codeUsed(evt) {
         if(username && state[username] && !state[username].welcomed) {
         	def phone = state[username].phone
         	twilio_sms(phone, "Welcome to ${location.name}, ${fname(username)}! Please let me know if you need anything as you get settled in.")
-            notify(ownersms, "$username has checked in")
+            sendPush("$username has checked in")
             state[username].welcomed = true
         }
     }
@@ -185,7 +185,7 @@ def delCode(data) {
     def guests = data?.guests
     def checkout = data?.checkout
 
-	twilio_sms(cleanersms, "Upcoming cleaning reminder for ${location.name}: ${guests} guests check out on ${checkout}")
+	twilio_sms(cleanersms, "Upcoming cleaning reminder for ${location.name}: ${guests} check out on ${checkout}")
     state[name].cleaners_notified = true
 }
 
@@ -326,16 +326,16 @@ def checkCodes() {
         	log.debug "${key}: Active (Add: ${ltf.format(addOnDate)} < Now: ${ltf.format(now)} < Del: ${ltf.format(delOnDate)})"
             if (!findSlotNamed(value.name)) {
             	// Can't call directly because it manipulates state (which we're iterating)
-            	runIn(1, addCode, [data: value])
+            	runIn(10, addCode, [data: value])
             	// Notify if it's getting close to checkin and still not added
                 if (now > warnOnDate) {
-               		notify(ownersms, "${value.name} is checking in soon, but lock code hasn't been added yet!")
+               		sendPush("${value.name} is checking in soon, but lock code hasn't been added yet!")
                 }
             }
             // Remind cleaners a couple days before guests check out
             if (now > cleanerNotifyDate && !value.cleaners_notified) {
             	// Can't call directly because it manipulates state (which we're iterating)
-            	runIn(1, notifyCleaners, [data: value])
+            	runIn(20, notifyCleaners, [data: value])
             }
         } else {
         	log.debug "${key}: Expired (Del: ${ltf.format(delOnDate)} < Now: ${ltf.format(now)})"
@@ -373,11 +373,11 @@ def addReservation() {
     	httpError(400, "Invalid check-out date")
     }
     state[name] = [name: name, phone: phone, guests: guests,
-    			   checkin: checkin, checkout: checkout,
+    			   checkin: fmtDate(checkin), checkout: fmtDate(checkout),
                    slot: 0, welcomed: false, cleaners_notified: false]
 
 	log.info "Lock code scheduled for $name, $guests staying $checkin to $checkout"
-    twilio_sms(cleanersms, "Please schedule a new cleaning for ${location.name} on ${fmtDate(checkout)}. There are ${guests} guests staying ${fmtDate(checkin)} to ${fmtDate(checkout)}")
+    //twilio_sms(cleanersms, "Cleaning reminder for ${location.name} on ${fmtDate(checkout)}. There are ${guests} staying ${fmtDate(checkin)} to ${fmtDate(checkout)}")
     checkCodes()
 }
 
@@ -394,8 +394,8 @@ def delReservation() {
     }
     state.each { key, value ->
     	if (value.phone == phone) {
-        	notify(ownersms, "${value.name} manually deleted")
-            twilio_sms(cleanersms, "Please cancel the cleaning scheduled for ${location.name} on ${fmtDate(value.checkout)}.  The guests cancelled.")
+        	sendPush("${value.name} manually deleted")
+            //twilio_sms(cleanersms, "Please cancel the cleaning scheduled for ${location.name} on ${fmtDate(value.checkout)}.  The guests cancelled.")
     		runIn(1, delCode, [data: value])
             retval = "Deleted ${value.name}"
         }
@@ -430,13 +430,13 @@ def editReservation() {
             	retval = retval + " phone (${keyval.phone} -> ${phone})"
             }
         }
-        if (checkin && checkin != keyval.checkin) {
-        	state[name].checkin = checkin
-        	retval = retval + " checkin (${fmtDate(keyval.checkin)} -> ${fmtDate(checkin)})"
+        if (checkin && fmtDate(checkin) != keyval.checkin) {
+        	state[name].checkin = fmtDate(checkin)
+        	retval = retval + " checkin (${keyval.checkin} -> ${fmtDate(checkin)})"
         }
-        if (checkout && checkout != keyval.checkout) {
-        	state[name].checkout = checkout
-        	retval = retval + " checkout (${fmtDate(keyval.checkout)} -> ${fmtDate(checkout)})"
+        if (checkout && fmtDate(checkout) != keyval.checkout) {
+        	state[name].checkout = fmtDate(checkout)
+        	retval = retval + " checkout (${keyval.checkout} -> ${fmtDate(checkout)})"
         }
         if (guests && guests != keyval.guests) {
         	state[name].guests = guests
@@ -475,13 +475,13 @@ def twilio_sms(sms, msg) {
         		log.debug "response data: ${resp.data}"
     		}
         } catch (e) {
-        	notify(ownersms, "Problem sending twilio sms to $sms: $e")
+        	sendPush("Problem sending twilio sms to $sms: $e")
 		}
     }
 }
 
 def routineRan(evt) {
-    notify(ownersms, "${location.name} ran routine ${evt.displayName}")
+    sendPush("${location.name} ran routine ${evt.displayName}")
 }
 
 def runRentedRoutine() {
