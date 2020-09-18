@@ -171,9 +171,17 @@ def delCode(data) {
         	runIn(1, runVacantRoutine)
         }
     } else {
-    	// We delete from state the second time around,
+    	// Send thank you when we remove the code, if we also welcomed them
+        if (state[name] && state[name].welcomed && state[name].phone) {
+        	def phone = state[name].phone
+            //def b64phone = phone.bytes.encodeBase64().toString()
+        	twilio_sms(phone, "Thanks for visting ${location.name}, ${fname(username)}! We hope you enjoyed your stay and will visit us again next year.")
+            twilio_sms(phone, "We'd love to hear your feedback! Please complete a 1 minute survey: https://www.730maplegate.com/review/")
+            sendPush("$name has been checked out")
+        }
+        // We delete from state the second time around,
         // once we know it's really gone from the lock
-        state.remove(name)
+        state.remove(name)	
     }
 }
 
@@ -185,7 +193,7 @@ def delCode(data) {
     def guests = data?.guests
     def checkout = data?.checkout
 
-	twilio_sms(cleanersms, "Upcoming cleaning reminder for ${location.name}: ${guests} check out on ${checkout}")
+	//twilio_sms(cleanersms, "Upcoming cleaning reminder for ${location.name}: ${guests} check out on ${checkout}")
     state[name].cleaners_notified = true
 }
 
